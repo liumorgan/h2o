@@ -104,3 +104,20 @@ module Kernel
   end
 
 end
+
+module H2O
+
+  class ErrorStream
+
+    def puts(*args)
+      args.each {|arg| write arg }
+      nil
+    end
+
+    def flush
+      self
+    end
+
+  end
+
+end

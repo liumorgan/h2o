@@ -47,6 +47,7 @@ struct st_mruby_subreq_t {
     mrb_value receiver;
     mrb_value ref;
     mrb_value chunks;
+    mrb_value env;
     h2o_mruby_generator_t *shortcut;
     unsigned char final_received : 1;
     unsigned char chain_proceed : 1;
@@ -65,6 +66,10 @@ static void dispose_subreq(struct st_mruby_subreq_t *subreq)
 {
     /* suqbre must be alive until generator gets disposed when shortcut used */
     assert(subreq->shortcut == NULL);
+
+    assert(!mrb_nil_p(subreq->env));
+    mrb_gc_unregister(subreq->ctx->shared->mrb, subreq->env);
+    subreq->env = mrb_nil_value();
 
     if (!mrb_nil_p(subreq->chunks)) {
         mrb_gc_unregister(subreq->ctx->shared->mrb, subreq->chunks);
@@ -369,10 +374,10 @@ static struct st_mruby_subreq_t *create_subreq(h2o_mruby_context_t *ctx, mrb_val
     int gc_arena = mrb_gc_arena_save(mrb);
     mrb_gc_protect(mrb, env);
 
-    env = mrb_funcall(mrb, env, "dup", 0);
+    mrb_value dupenv = mrb_funcall(mrb, env, "dup", 0);
 
 #define RETRIEVE_ENV(key, v, required, stringify) do { \
-    v = mrb_hash_delete_key(mrb, env, mrb_ary_entry(ctx->shared->constants, H2O_MRUBY_LIT_ ## key)); \
+    v = mrb_hash_delete_key(mrb, dupenv, mrb_ary_entry(ctx->shared->constants, H2O_MRUBY_LIT_ ## key)); \
     if (required && mrb_nil_p(v)) { \
         mrb->exc = mrb_obj_ptr(mrb_exc_new_str_lit(mrb, E_RUNTIME_ERROR, "missing required environment key: ## key")); \
         goto Failed; \
@@ -383,7 +388,7 @@ static struct st_mruby_subreq_t *create_subreq(h2o_mruby_context_t *ctx, mrb_val
 } while (0)
 
     /* retrieve env variables */
-    mrb_value scheme, method, script_name, path_info, query_string, rack_input, server_addr, server_port, remote_addr, remote_port, server_protocol, remaining_delegations, remaining_reprocesses, _dummy;
+    mrb_value scheme, method, script_name, path_info, query_string, rack_input, server_addr, server_port, remote_addr, remote_port, server_protocol, remaining_delegations, remaining_reprocesses, rack_errors, _dummy;
     RETRIEVE_ENV(RACK_URL_SCHEME, scheme, 1, 1);
     RETRIEVE_ENV(REQUEST_METHOD, method, 1, 1);
     RETRIEVE_ENV(SERVER_ADDR, server_addr, 0, 1);
@@ -401,7 +406,7 @@ static struct st_mruby_subreq_t *create_subreq(h2o_mruby_context_t *ctx, mrb_val
     RETRIEVE_ENV(RACK_MULTIPROCESS, _dummy, 0, 0);
     RETRIEVE_ENV(RACK_RUN_ONCE, _dummy, 0, 0);
     RETRIEVE_ENV(RACK_HIJACK_, _dummy, 0, 0);
-    RETRIEVE_ENV(RACK_ERRORS, _dummy, 0, 0);
+    RETRIEVE_ENV(RACK_ERRORS, rack_errors, 0, 0);
     RETRIEVE_ENV(SERVER_SOFTWARE, _dummy, 0, 0);
     RETRIEVE_ENV(H2O_REMAINING_DELEGATIONS, remaining_delegations, 0, 0);
     RETRIEVE_ENV(H2O_REMAINING_REPROCESSES, remaining_reprocesses, 0, 0);
@@ -476,7 +481,17 @@ static struct st_mruby_subreq_t *create_subreq(h2o_mruby_context_t *ctx, mrb_val
         super->remaining_reprocesses = (unsigned)(v < 0 ? 0 : v);
     }
 
-    //    subreq->super.error_logs = parent->error_logs; // TODO
+    if (! mrb_nil_p(rack_errors)) {
+        h2o_mruby_error_stream_t *error_stream;
+        if ((error_stream = h2o_mruby_get_error_stream(mrb, rack_errors)) != NULL) {
+            /*
+             * use error_logs buffer in error_stream, which is owned by the parent request.
+             * when the parent request is disposed, this pointer of will be set to NULL
+             */
+            super->error_logs = &error_stream->error_logs;
+        }
+    }
+
     super->is_subrequest = 1;
 
     subreq->ctx = ctx;
@@ -484,13 +499,15 @@ static struct st_mruby_subreq_t *create_subreq(h2o_mruby_context_t *ctx, mrb_val
     subreq->ref = mrb_nil_value();
     subreq->chunks = mrb_ary_new(mrb);
     mrb_gc_register(mrb, subreq->chunks);
+    subreq->env = env;
+    mrb_gc_register(mrb, subreq->env);
     subreq->shortcut = NULL;
     subreq->final_received = 0;
     subreq->chain_proceed = 0;
 
     /* headers */
     super->headers = (h2o_headers_t){NULL};
-    if (h2o_mruby_iterate_headers(ctx->shared, env, handle_request_header, subreq) != 0) {
+    if (h2o_mruby_iterate_headers(ctx->shared, dupenv, handle_request_header, subreq) != 0) {
         goto Failed;
     }
 
@@ -500,12 +517,12 @@ static struct st_mruby_subreq_t *create_subreq(h2o_mruby_context_t *ctx, mrb_val
         goto Failed;
 
     /* env */
-    mrb_value other_keys = mrb_hash_keys(mrb, env);
+    mrb_value other_keys = mrb_hash_keys(mrb, dupenv);
     for (i = 0; i != RARRAY_LEN(other_keys); ++i) {
         mrb_value key = h2o_mruby_to_str(mrb, mrb_ary_entry(other_keys, i));
         if (memcmp(RSTRING_PTR(key), "HTTP_", 5) == 0)
             continue;
-        mrb_value val = h2o_mruby_to_str(mrb, mrb_hash_get(mrb, env, key));
+        mrb_value val = h2o_mruby_to_str(mrb, mrb_hash_get(mrb, dupenv, key));
         h2o_vector_reserve(&super->pool, &super->env, super->env.size + 2);
         super->env.entries[super->env.size] = h2o_strdup(&super->pool, RSTRING_PTR(key), RSTRING_LEN(key));
         super->env.entries[super->env.size + 1] = h2o_strdup(&super->pool, RSTRING_PTR(val), RSTRING_LEN(val));

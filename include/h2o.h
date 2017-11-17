@@ -933,6 +933,7 @@ typedef struct st_h2o_req_error_log_t {
     const char *module;
     h2o_iovec_t msg;
 } h2o_req_error_log_t;
+typedef H2O_VECTOR(h2o_req_error_log_t) h2o_req_error_logs_t;
 
 typedef void (*h2o_proceed_req_cb)(h2o_req_t *req, size_t written, int is_end_stream);
 typedef int (*h2o_write_req_cb)(void *ctx, h2o_iovec_t chunk, int is_end_stream);
@@ -1073,7 +1074,9 @@ struct st_h2o_req_t {
     /**
      * error logs
      */
-    H2O_VECTOR(h2o_req_error_log_t) error_logs;
+    h2o_req_error_logs_t __error_logs; // TODO: rename
+    h2o_req_error_logs_t *_error_logs;
+    h2o_req_error_logs_t **error_logs;
 
     /* flags */
 

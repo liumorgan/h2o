@@ -5,6 +5,7 @@ use File::Temp qw(tempdir);
 use Net::EmptyPort qw(empty_port check_port);
 use Test::More;
 use Test::Exception;
+use Time::HiRes;
 use t::Util;
 
 plan skip_all => 'mruby support is off'
@@ -72,6 +73,15 @@ my %files = map { do {
     +($_ => { size => (stat $fn)[7], md5 => md5_hex($content), content => $content });
 } } qw(index.txt halfdome.jpg);
 
+my $live_check = sub {
+    my ($proto, $port, $curl) = @_;
+    local $Test::Builder::Level = $Test::Builder::Level + 1;
+    lives_ok {
+        my ($status, $headers, $body) = get($proto, $port, $curl, '/live-check');
+        is $status, 200, 'live status check';
+    } 'live check';
+};
+
 sub doit {
     my ($mode, $file, $next, $opts) = @_;
     $opts ||= +{};
@@ -131,14 +141,6 @@ EOT
         die "unexpected mode: $mode";
     }
 
-    my $live_check = sub {
-        my ($proto, $port, $curl) = @_;
-        local $Test::Builder::Level = $Test::Builder::Level + 1;
-        lives_ok {
-            my ($status, $headers, $body) = get($proto, $port, $curl, '/live-check');
-            is $status, 200, 'live status check';
-        }, 'live check';
-    };
     my $reprocess_check = sub {
         my ($headers) = @_;
         return unless $mode eq 'reprocess';
@@ -645,6 +647,137 @@ EOT
         unlike $body, qr{^foo:FOO$}m;
         like $body, qr{^bar:BAR$}m;
     });
+};
+
+subtest 'error logs' => sub {
+    my $tempdir = tempdir(CLEANUP => 1);
+    my $access_log_file = "$tempdir/access.log";
+    my $error_log_file = "$tempdir/error.log";
+
+    my $read_logs = sub {
+       map {
+           my $fn = $_;
+           open my $fh, "<", $fn or die "failed to open $fn:$!";
+           [ map { my $l = $_; chomp $l; $l } <$fh> ];
+       } ($access_log_file, $error_log_file);
+    };
+
+    subtest 'basic' => sub {
+        my $empty_port = empty_port();
+        my $server = spawn_h2o(sub {
+            my ($port, $tls_port) = @_;
+            << "EOT";
+hosts:
+  "127.0.0.1:$port":
+    paths: &paths
+      /:
+        - mruby.handler: |
+            proc {|env|
+              H2O.next.call(env)
+            }
+        # this specifies an empty port, so the connection will fail immediately and emit error log
+        - proxy.reverse.url: http://127.0.0.1:$empty_port
+  "127.0.0.1:$tls_port":
+    paths: *paths
+access-log:
+  path: $access_log_file
+  format: "error:%{error}x"
+error-log: $error_log_file
+EOT
+        });
+        run_with_curl($server, sub {
+            my ($proto, $port, $curl) = @_;
+            truncate $access_log_file, 0;
+            truncate $error_log_file, 0;
+
+            my ($status, $headers, $body);
+            ($status, $headers, $body) = get($proto, $port, $curl, '/');
+            is $status, 502;
+
+            my ($access_logs, $error_logs) = $read_logs->();
+            is scalar(@$access_logs), 1, 'access log count';
+            isnt scalar(@$error_logs), 0, 'error log count';
+            is $access_logs->[0], 'error:[lib/core/proxy.c] connection failed', 'access log';
+            is $error_logs->[-1], '[lib/core/proxy.c] in request:/:connection failed', 'error log';
+        });
+    };
+
+    subtest 'parent request is disposed before subrequest emits error logs' => sub {
+
+        my $spawner = sub {
+            my $upstream_port = empty_port();
+
+            # create upstream
+            fork or do {
+                my $sock = IO::Socket::INET->new(
+                    LocalHost => '127.0.0.1',
+                    LocalPort => $upstream_port,
+                    Proto => 'tcp',
+                    Listen => 1,
+                    Reuse => 1,
+                ) or die $!;
+                my $client = $sock->accept;
+                while (1) {
+                    my $req = '';
+                    $client->recv($req, 1024);
+                    last if $req =~ /\r\n\r\n$/;
+                }
+                $client->send("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+                Time::HiRes::sleep 0.5;
+                $client->send("X"); # this causes an invalid chunk error in proxy handler
+                $client->close;
+                exit;
+            };
+            spawn_h2o(sub {
+                my ($port, $tls_port) = @_;
+                << "EOT";
+hosts:
+  "127.0.0.1:$port":
+    paths: &paths
+      /live-check:
+        - mruby.handler: proc {|env| [200, {}, []] }
+      /:
+        - mruby.handler: |
+            proc {|env|
+              resp = H2O.next.call(env)
+              [resp[0], resp[1], []] # respond without waiting body
+            }
+        - proxy.reverse.url: http://127.0.0.1:$upstream_port
+  "127.0.0.1:$tls_port":
+    paths: *paths
+access-log:
+  path: $access_log_file
+  format: "error:%{error}x"
+error-log: $error_log_file
+EOT
+            });
+        };
+
+        run_with_curl({}, sub {
+            my ($proto, undef, $curl) = @_;
+            truncate $access_log_file, 0;
+            truncate $error_log_file, 0;
+
+            my $server = $spawner->();
+            my $port = $proto eq 'http' ? $server->{port} : $server->{tls_port};
+
+            my ($status, $headers, $body);
+            ($status, $headers, $body) = get($proto, $port, $curl, '/');
+            is $status, 200;
+
+            # after 0.5 sec, the proxy handler should emit an invalid chunk error
+            sleep 1;
+
+            my ($access_logs, $error_logs) = $read_logs->();
+
+            is scalar(@$access_logs), 1, 'access log count';
+            isnt scalar(@$error_logs), 0, 'error log count';
+            is $access_logs->[0], 'error:', 'access log';
+            is $error_logs->[-1], '[lib/core/proxy.c] in request:/:failed to parse the response (chunked)', 'error log';
+
+            $live_check->($proto, $port, $curl);
+        });
+    };
 };
 
 done_testing();

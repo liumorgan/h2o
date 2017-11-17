@@ -79,6 +79,17 @@
     "  def sleep(*sec)\n"                                                                                                          \
     "    _h2o__sleep(*sec)\n"                                                                                                      \
     "  end\n"                                                                                                                      \
+    "end\n"                                                                                                                        \
+    "module H2O\n"                                                                                                                 \
+    "  class ErrorStream\n"                                                                                                        \
+    "    def puts(*args)\n"                                                                                                        \
+    "      args.each {|arg| write arg }\n"                                                                                         \
+    "      nil\n"                                                                                                                  \
+    "    end\n"                                                                                                                    \
+    "    def flush\n"                                                                                                              \
+    "      self\n"                                                                                                                 \
+    "    end\n"                                                                                                                    \
+    "  end\n"                                                                                                                      \
     "end\n"
 
 /* lib/handler/mruby/embedded/http_request.rb */
