@@ -65,7 +65,8 @@ static void on_gc_dispose_error_stream(mrb_state *mrb, void *_error_stream)
     h2o_mruby_error_stream_t *error_stream = _error_stream;
     if (error_stream == NULL)
         return;
-    error_stream->generator->refs.error_stream = mrb_nil_value();
+    if (error_stream->generator != NULL)
+        error_stream->generator->refs.error_stream = mrb_nil_value();
     free(error_stream);
 }
 
